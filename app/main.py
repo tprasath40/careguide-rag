@@ -1,5 +1,7 @@
 import os
 from io import BytesIO
+import json
+from collections.abc import Iterator
 
 import anthropic
 from dotenv import load_dotenv
@@ -11,6 +13,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
@@ -181,6 +184,11 @@ def generate_answer(question: str, retrieved_chunks: list[dict]) -> str:
     return message.content[0].text
 
 
+def format_sse_event(event: str, data: dict) -> str:
+
+    return f"event: {event}\n" f"data: {json.dumps(data)}\n\n"
+
+
 def retrieve_node(state: RagState) -> dict:
     chunks = retrieve_chunks(question=state["question"], top_k=state["top_k"])
 
@@ -307,3 +315,130 @@ def query_document(request: QuestionRequest):
             "and is not a substitute for professional medical advice."
         ),
     }
+
+
+@app.post("/query/stream")
+def stream_query_document(request: QuestionRequest):
+
+    return StreamingResponse(
+        stream_query_events(question=request.question, top_k=request.top_k),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def stream_claude_answer(question: str, retrieved_chunks: list[dict]) -> Iterator[str]:
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500, detail="ANTHROPIC_API_KEY is not configured"
+        )
+
+    context_parts = []
+
+    for chunk in retrieved_chunks:
+        source_label = f"[{chunk['filename']} - " f"chunk {chunk['chunk_id']}]"
+
+        context_parts.append(f"{source_label}\n{chunk['text']}")
+
+    context = "\n\n".join(context_parts)
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    with client.messages.stream(
+        model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5"),
+        max_tokens=500,
+        system=(
+            "You are CareGuide, a healthcare document assistant. "
+            "Answer only using the supplied document context. "
+            "Do not provide a diagnosis or invent medical facts. "
+            "Cite relevant sources using their exact square-bracket "
+            "labels. If the context does not contain the answer, say "
+            "'I could not find that information in the uploaded documents.'"
+        ),
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"DOCUMENT CONTEXT:\n{context}\n\n" f"QUESTION:\n{question}"
+                ),
+            }
+        ],
+    ) as stream:
+
+        for text in stream.text_stream:
+            yield text
+
+
+def stream_query_events(question: str, top_k: int) -> Iterator[str]:
+
+    try:
+        retrieved_chunks = retrieve_chunks(question=question, top_k=top_k)
+
+        sources = [
+            {
+                "filename": chunk["filename"],
+                "chunk_id": chunk["chunk_id"],
+                "score": chunk["score"],
+                "preview": chunk["text"][:200],
+            }
+            for chunk in retrieved_chunks
+        ]
+
+        yield format_sse_event(event="sources", data={"sources": sources})
+
+        highest_score = sources[0]["score"] if sources else 0
+
+        if highest_score < MIN_RELEVANCE_SCORE:
+            fallback_answer = (
+                "I could not find relevant information " "in the uploaded documents."
+            )
+
+            yield format_sse_event(event="token", data={"text": fallback_answer})
+
+            yield format_sse_event(
+                event="done",
+                data={"status": "completed", "workflow": ["retrieve", "fallback"]},
+            )
+
+            return
+
+        for token in stream_claude_answer(
+            question=question, retrieved_chunks=retrieved_chunks
+        ):
+            yield format_sse_event(event="token", data={"text": token})
+
+        yield format_sse_event(
+            event="done",
+            data={
+                "status": "completed",
+                "workflow": ["retrieve", "generate", "stream"],
+            },
+        )
+
+    except HTTPException as error:
+        yield format_sse_event(
+            event="error", data={"status": error.status_code, "message": error.detail}
+        )
+
+    except anthropic.APIError:
+        yield format_sse_event(
+            event="error",
+            data={
+                "status": 502,
+                "message": (
+                    "The language model service " "could not complete the request"
+                ),
+            },
+        )
+
+    except Exception:
+        yield format_sse_event(
+            event="error", data={"status": 500, "message": "Unexpected streaming error"}
+        )
