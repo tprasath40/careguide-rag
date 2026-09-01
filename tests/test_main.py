@@ -2,11 +2,8 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.main import (
-    app,
-    chunk_text,
-    extract_text_from_file
-)
+from app.main import app
+from app.services.document_service import chunk_text, extract_text_from_file
 
 
 client = TestClient(app)
