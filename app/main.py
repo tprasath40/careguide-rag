@@ -2,13 +2,15 @@ import os
 from io import BytesIO
 
 import anthropic
-import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from typing import TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 load_dotenv()
 
@@ -16,15 +18,23 @@ app = FastAPI(
     title="CareGuide RAG API",
     description=(
         "A healthcare document question-answering application "
-        "using semantic retrieval and Claude"
+        "using TF-IDF retrieval, LangGraph and Claude"
     ),
-    version="1.0.0"
+    version="1.0.0",
 )
 
 
 stored_chunks: list[dict] = []
 vectorizer: TfidfVectorizer | None = None
 stored_vectors = None
+MIN_RELEVANCE_SCORE = 0.05
+
+
+class RagState(TypedDict):
+    question: str
+    top_k: int
+    retrieved_chunks: list[dict]
+    answer: str
 
 
 class QuestionRequest(BaseModel):
@@ -32,11 +42,7 @@ class QuestionRequest(BaseModel):
     top_k: int = Field(default=3, ge=1, le=5)
 
 
-def chunk_text(
-    text: str,
-    chunk_size: int = 500,
-    overlap: int = 100
-) -> list[str]:
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
 
     if chunk_size <= 0:
         raise ValueError("Chunk size must be greater than zero")
@@ -63,10 +69,7 @@ def chunk_text(
     return chunks
 
 
-def extract_text_from_file(
-    filename: str,
-    content: bytes
-) -> tuple[str, int]:
+def extract_text_from_file(filename: str, content: bytes) -> tuple[str, int]:
 
     lower_filename = filename.lower()
 
@@ -76,74 +79,43 @@ def extract_text_from_file(
     if lower_filename.endswith(".pdf"):
         reader = PdfReader(BytesIO(content))
 
-        extracted_pages = [
-            page.extract_text() or ""
-            for page in reader.pages
-        ]
+        extracted_pages = [page.extract_text() or "" for page in reader.pages]
 
         return "\n".join(extracted_pages), len(reader.pages)
 
     raise HTTPException(
-        status_code=415,
-        detail="Only TXT and PDF files are currently supported"
+        status_code=415, detail="Only TXT and PDF files are currently supported"
     )
 
 
-def store_document(
-    filename: str,
-    chunks: list[str]
-) -> None:
+def store_document(filename: str, chunks: list[str]) -> None:
 
     global stored_chunks
     global vectorizer
     global stored_vectors
 
-    stored_chunks = [
-        item
-        for item in stored_chunks
-        if item["filename"] != filename
-    ]
+    stored_chunks = [item for item in stored_chunks if item["filename"] != filename]
 
     for index, chunk in enumerate(chunks):
-        stored_chunks.append({
-            "filename": filename,
-            "chunk_id": index,
-            "text": chunk
-        })
+        stored_chunks.append({"filename": filename, "chunk_id": index, "text": chunk})
 
-    all_texts = [
-        item["text"]
-        for item in stored_chunks
-    ]
+    all_texts = [item["text"] for item in stored_chunks]
 
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        ngram_range=(1, 2)
-    )
+    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
 
     stored_vectors = vectorizer.fit_transform(all_texts)
 
-def retrieve_chunks(
-    question: str,
-    top_k: int
-) -> list[dict]:
 
-    if (
-        not stored_chunks
-        or vectorizer is None
-        or stored_vectors is None
-    ):
+def retrieve_chunks(question: str, top_k: int) -> list[dict]:
+
+    if not stored_chunks or vectorizer is None or stored_vectors is None:
         raise HTTPException(
-            status_code=400,
-            detail="Upload a document before asking questions"
+            status_code=400, detail="Upload a document before asking questions"
         )
 
     question_vector = vectorizer.transform([question])
 
-    scores = cosine_similarity(
-        question_vector,
-        stored_vectors
-    ).flatten()
+    scores = cosine_similarity(question_vector, stored_vectors).flatten()
 
     result_count = min(top_k, len(stored_chunks))
     best_indices = scores.argsort()[::-1][:result_count]
@@ -153,49 +125,40 @@ def retrieve_chunks(
     for index in best_indices:
         chunk = stored_chunks[int(index)]
 
-        results.append({
-            "filename": chunk["filename"],
-            "chunk_id": chunk["chunk_id"],
-            "text": chunk["text"],
-            "score": round(float(scores[index]), 4)
-        })
+        results.append(
+            {
+                "filename": chunk["filename"],
+                "chunk_id": chunk["chunk_id"],
+                "text": chunk["text"],
+                "score": round(float(scores[index]), 4),
+            }
+        )
 
     return results
 
 
-def generate_answer(
-    question: str,
-    retrieved_chunks: list[dict]
-) -> str:
+def generate_answer(question: str, retrieved_chunks: list[dict]) -> str:
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
 
     if not api_key:
         raise HTTPException(
-            status_code=500,
-            detail="ANTHROPIC_API_KEY is not configured"
+            status_code=500, detail="ANTHROPIC_API_KEY is not configured"
         )
 
     context_parts = []
 
     for chunk in retrieved_chunks:
-        source_label = (
-            f"[{chunk['filename']} - chunk {chunk['chunk_id']}]"
-        )
+        source_label = f"[{chunk['filename']} - chunk {chunk['chunk_id']}]"
 
-        context_parts.append(
-            f"{source_label}\n{chunk['text']}"
-        )
+        context_parts.append(f"{source_label}\n{chunk['text']}")
 
     context = "\n\n".join(context_parts)
 
     client = anthropic.Anthropic(api_key=api_key)
 
     message = client.messages.create(
-        model=os.getenv(
-            "CLAUDE_MODEL",
-            "claude-haiku-4-5"
-        ),
+        model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5"),
         max_tokens=500,
         system=(
             "You are CareGuide, a healthcare document assistant. "
@@ -209,53 +172,75 @@ def generate_answer(
             {
                 "role": "user",
                 "content": (
-                    f"DOCUMENT CONTEXT:\n{context}\n\n"
-                    f"QUESTION:\n{question}"
-                )
+                    f"DOCUMENT CONTEXT:\n{context}\n\n" f"QUESTION:\n{question}"
+                ),
             }
-        ]
+        ],
     )
 
     return message.content[0].text
 
 
-@app.get("/health")
-def get_health():
+def retrieve_node(state: RagState) -> dict:
+    chunks = retrieve_chunks(question=state["question"], top_k=state["top_k"])
+
+    return {"retrieved_chunks": chunks}
+
+
+def generate_node(state: RagState) -> dict:
+    answer = generate_answer(
+        question=state["question"], retrieved_chunks=state["retrieved_chunks"]
+    )
+
+    return {"answer": answer}
+
+
+def fallback_node(state: RagState) -> dict:
     return {
-        "status": "healthy",
-        "service": "careguide-rag"
+        "answer": (
+            "I could not find relevant information " "in the uploaded documents."
+        )
     }
 
 
+def route_after_retrieval(state: RagState) -> str:
+    chunks = state["retrieved_chunks"]
+
+    if not chunks:
+        return "fallback"
+
+    highest_score = chunks[0]["score"]
+
+    if highest_score < MIN_RELEVANCE_SCORE:
+        return "fallback"
+
+    return "generate"
+
+
+@app.get("/health")
+def get_health():
+    return {"status": "healthy", "service": "careguide-rag"}
+
+
 @app.post("/documents/upload")
-async def upload_document(
-    file: UploadFile = File(...)
-):
+async def upload_document(file: UploadFile = File(...)):
 
     filename = file.filename or "uploaded-document"
     content = await file.read()
 
     if not content:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty"
-        )
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     try:
-        text, pages = extract_text_from_file(
-            filename,
-            content
-        )
+        text, pages = extract_text_from_file(filename, content)
     except UnicodeDecodeError as error:
         raise HTTPException(
-            status_code=422,
-            detail="TXT file must use UTF-8 encoding"
+            status_code=422, detail="TXT file must use UTF-8 encoding"
         ) from error
 
     if not text.strip():
         raise HTTPException(
-            status_code=422,
-            detail="No readable text found in the document"
+            status_code=422, detail="No readable text found in the document"
         )
 
     chunks = chunk_text(text)
@@ -266,21 +251,38 @@ async def upload_document(
         "characters": len(text),
         "pages": pages,
         "chunks_created": len(chunks),
-        "message": "Document indexed successfully"
+        "message": "Document indexed successfully",
     }
+
+
+rag_workflow = StateGraph(RagState)
+
+rag_workflow.add_node("retrieve", retrieve_node)
+rag_workflow.add_node("generate", generate_node)
+rag_workflow.add_node("fallback", fallback_node)
+
+rag_workflow.add_edge(START, "retrieve")
+
+rag_workflow.add_conditional_edges(
+    "retrieve", route_after_retrieval, {"generate": "generate", "fallback": "fallback"}
+)
+
+rag_workflow.add_edge("generate", END)
+rag_workflow.add_edge("fallback", END)
+
+rag_graph = rag_workflow.compile()
 
 
 @app.post("/query")
 def query_document(request: QuestionRequest):
 
-    retrieved_chunks = retrieve_chunks(
-        question=request.question,
-        top_k=request.top_k
-    )
-
-    answer = generate_answer(
-        question=request.question,
-        retrieved_chunks=retrieved_chunks
+    result = rag_graph.invoke(
+        {
+            "question": request.question,
+            "top_k": request.top_k,
+            "retrieved_chunks": [],
+            "answer": "",
+        }
     )
 
     sources = [
@@ -288,17 +290,20 @@ def query_document(request: QuestionRequest):
             "filename": chunk["filename"],
             "chunk_id": chunk["chunk_id"],
             "score": chunk["score"],
-            "preview": chunk["text"][:200]
+            "preview": chunk["text"][:200],
         }
-        for chunk in retrieved_chunks
+        for chunk in result["retrieved_chunks"]
     ]
+
+    used_fallback = not sources or sources[0]["score"] < MIN_RELEVANCE_SCORE
 
     return {
         "question": request.question,
-        "answer": answer,
+        "answer": result["answer"],
         "sources": sources,
+        "workflow": ["retrieve", "fallback" if used_fallback else "generate"],
         "disclaimer": (
             "This application provides document-based information only "
             "and is not a substitute for professional medical advice."
-        )
+        ),
     }
